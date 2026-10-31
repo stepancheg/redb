@@ -1,4 +1,5 @@
 use crate::types::{TypeName, Value};
+use crate::{Result, StorageError};
 use alloc::format;
 use alloc::vec::Vec;
 
@@ -51,21 +52,9 @@ impl<T: Value> Value for Vec<T> {
     where
         Self: 'a,
     {
-        let (elements, mut offset) = decode_varint_len(data);
-        let mut result = Vec::with_capacity(elements);
-        for _ in 0..elements {
-            let element_len = if let Some(len) = T::fixed_width() {
-                len
-            } else {
-                let (len, consumed) = decode_varint_len(&data[offset..]);
-                offset += consumed;
-                len
-            };
-            result.push(T::from_bytes(&data[offset..(offset + element_len)]));
-            offset += element_len;
-        }
-        assert_eq!(offset, data.len());
-        result
+        // Value::from_bytes cannot return Result. try_vec_from_bytes reports the same input as
+        // StorageError::Corrupted; every read still goes through this method.
+        try_vec_from_bytes::<T>(data).unwrap_or_else(|error| panic!("{error}"))
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Vec<T::SelfType<'b>>) -> Vec<u8>
@@ -93,5 +82,111 @@ impl<T: Value> Value for Vec<T> {
         let inner = T::type_name();
         TypeName::internal(&format!("Vec<{}>", inner.name()))
             .into_composite(inner.is_user_defined())
+    }
+}
+
+// `Value::from_bytes` is infallible, so this is the fallible decode. Nothing in the read path
+// can call it: table reads decode through `Value::from_bytes`.
+pub(crate) fn try_vec_from_bytes<T: Value>(data: &[u8]) -> Result<Vec<T::SelfType<'_>>> {
+    let (elements, mut offset) = read_varint_len(data, 0)?;
+    let mut result = Vec::with_capacity(elements.min(data.len()));
+    for _ in 0..elements {
+        let element_len = if let Some(len) = T::fixed_width() {
+            len
+        } else {
+            let (len, consumed) = read_varint_len(data, offset)?;
+            offset += consumed;
+            len
+        };
+        let Some(end) = offset
+            .checked_add(element_len)
+            .filter(|end| *end <= data.len())
+        else {
+            return Err(StorageError::Corrupted(format!(
+                "Invalid Vec element length {element_len} at offset {offset} in a {} byte value",
+                data.len()
+            )));
+        };
+        result.push(T::from_bytes(&data[offset..end]));
+        offset = end;
+    }
+    if offset != data.len() {
+        return Err(StorageError::Corrupted(format!(
+            "Invalid Vec length: decoded {offset} bytes from a {} byte value",
+            data.len()
+        )));
+    }
+    Ok(result)
+}
+
+fn read_varint_len(data: &[u8], offset: usize) -> Result<(usize, usize)> {
+    let rest = data.get(offset..).unwrap_or(&[]);
+    let Some(&tag) = rest.first() else {
+        return Err(StorageError::Corrupted(format!(
+            "Invalid Vec length prefix at offset {offset} in a {} byte value",
+            data.len()
+        )));
+    };
+    match tag {
+        0..=253 => Ok((usize::from(tag), 1)),
+        254 => {
+            let Some(bytes) = rest.get(1..3) else {
+                return Err(StorageError::Corrupted(format!(
+                    "Invalid Vec length prefix {tag} at offset {offset}: need 3 bytes, {} remain in a {} byte value",
+                    rest.len(),
+                    data.len()
+                )));
+            };
+            Ok((
+                usize::from(u16::from_le_bytes(bytes.try_into().unwrap())),
+                3,
+            ))
+        }
+        255 => {
+            let Some(bytes) = rest.get(1..5) else {
+                return Err(StorageError::Corrupted(format!(
+                    "Invalid Vec length prefix {tag} at offset {offset}: need 5 bytes, {} remain in a {} byte value",
+                    rest.len(),
+                    data.len()
+                )));
+            };
+            Ok((u32::from_le_bytes(bytes.try_into().unwrap()) as usize, 5))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_vec_from_bytes;
+    use crate::{StorageError, Value};
+
+    #[test]
+    fn malformed_vec_length_is_corrupted() {
+        let bytes = <Vec<u8> as Value>::as_bytes(&vec![1, 2, 3]);
+        assert_eq!(
+            try_vec_from_bytes::<u8>(bytes.as_ref()).unwrap(),
+            vec![1, 2, 3]
+        );
+
+        let err = try_vec_from_bytes::<u8>(&[1]).unwrap_err();
+        let StorageError::Corrupted(message) = err else {
+            panic!("unexpected error");
+        };
+        assert!(message.contains("length 1"), "{message}");
+
+        let err = try_vec_from_bytes::<u8>(&[0, 9]).unwrap_err();
+        let StorageError::Corrupted(message) = err else {
+            panic!("unexpected error");
+        };
+        assert!(
+            message.contains("decoded 1") && message.contains("2 byte"),
+            "{message}"
+        );
+
+        let err = try_vec_from_bytes::<u8>(&[254]).unwrap_err();
+        let StorageError::Corrupted(message) = err else {
+            panic!("unexpected error");
+        };
+        assert!(message.contains("254"), "{message}");
     }
 }
