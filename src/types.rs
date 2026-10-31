@@ -1,3 +1,4 @@
+use crate::{Result, StorageError};
 use alloc::borrow::Cow;
 use alloc::format;
 use alloc::string::String;
@@ -38,13 +39,15 @@ impl TypeClassification {
         }
     }
 
-    fn from_byte(value: u8) -> Self {
+    fn from_byte(value: u8) -> Result<Self> {
         match value {
-            1 => TypeClassification::Internal,
-            2 => TypeClassification::UserDefined,
-            3 => TypeClassification::Internal2,
-            4 => TypeClassification::Internal3,
-            _ => unreachable!(),
+            1 => Ok(TypeClassification::Internal),
+            2 => Ok(TypeClassification::UserDefined),
+            3 => Ok(TypeClassification::Internal2),
+            4 => Ok(TypeClassification::Internal3),
+            _ => Err(StorageError::Corrupted(format!(
+                "Invalid type classification byte {value}"
+            ))),
         }
     }
 }
@@ -104,15 +107,18 @@ impl TypeName {
         result
     }
 
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
-        let classification = TypeClassification::from_byte(bytes[0]);
-        let name = core::str::from_utf8(&bytes[1..]).unwrap().to_string();
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let (classification, name) = bytes.split_first().ok_or_else(|| {
+            StorageError::Corrupted("Type name is missing its classification byte".to_string())
+        })?;
+        let classification = TypeClassification::from_byte(*classification)?;
+        let name = core::str::from_utf8(name).unwrap().to_string();
 
-        Self {
+        Ok(Self {
             classification,
             name,
             legacy_classification: None,
-        }
+        })
     }
 
     pub fn name(&self) -> &str {

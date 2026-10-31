@@ -349,20 +349,8 @@ impl InternalTableDefinition {
             | InternalTableDefinition::Multimap { value_type, .. } => value_type.clone(),
         }
     }
-}
 
-impl Value for InternalTableDefinition {
-    type SelfType<'a> = InternalTableDefinition;
-    type AsBytes<'a> = Vec<u8>;
-
-    fn fixed_width() -> Option<usize> {
-        None
-    }
-
-    fn from_bytes<'a>(data: &'a [u8]) -> Self
-    where
-        Self: 'a,
-    {
+    pub(crate) fn try_from_bytes(data: &[u8]) -> Result<Self> {
         debug_assert!(data.len() > 22);
         let mut offset = 0;
         let legacy = TableType::is_legacy(data[offset]);
@@ -436,11 +424,11 @@ impl Value for InternalTableDefinition {
                 .unwrap(),
         ) as usize;
         offset += size_of::<u32>();
-        let key_type = TypeName::from_bytes(&data[offset..(offset + key_type_len)]);
+        let key_type = TypeName::from_bytes(&data[offset..(offset + key_type_len)])?;
         offset += key_type_len;
-        let value_type = TypeName::from_bytes(&data[offset..]);
+        let value_type = TypeName::from_bytes(&data[offset..])?;
 
-        match table_type {
+        Ok(match table_type {
             TableType::Normal => InternalTableDefinition::Normal {
                 table_root,
                 table_length,
@@ -461,7 +449,24 @@ impl Value for InternalTableDefinition {
                 key_type,
                 value_type,
             },
-        }
+        })
+    }
+}
+
+impl Value for InternalTableDefinition {
+    type SelfType<'a> = InternalTableDefinition;
+    type AsBytes<'a> = Vec<u8>;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self
+    where
+        Self: 'a,
+    {
+        // The Value trait cannot return Result. Reads of the table tree use try_from_bytes.
+        Self::try_from_bytes(data).unwrap_or_else(|error| panic!("{error}"))
     }
 
     // Be careful if you change this serialization format! The InternalTableDefinition for

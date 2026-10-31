@@ -261,6 +261,10 @@ impl<'a, V: Value + 'static> AccessGuard<'a, V> {
         V::from_bytes(&self.page.memory()[self.offset..(self.offset + self.len)])
     }
 
+    pub(crate) fn value_bytes(&self) -> &[u8] {
+        &self.page.memory()[self.offset..(self.offset + self.len)]
+    }
+
     pub(crate) fn arc_view(&self) -> (Arc<[u8]>, Range<usize>) {
         match &self.page {
             EitherPage::Immutable(page) => (page.to_arc(), self.offset..(self.offset + self.len)),
