@@ -57,7 +57,12 @@ impl Iterator for TableNameIter {
         for entry in self.inner.by_ref() {
             match entry {
                 Ok(entry) => {
-                    if entry.value().get_type() == self.table_type {
+                    let definition =
+                        match InternalTableDefinition::try_from_bytes(entry.value_bytes()) {
+                            Ok(definition) => definition,
+                            Err(err) => return Some(Err(err)),
+                        };
+                    if definition.get_type() == self.table_type {
                         return Some(Ok(entry.key().to_string()));
                     }
                 }
@@ -99,7 +104,7 @@ impl TableTree {
 
         for entry in self.tree.range::<RangeFull, &str>(&(..))? {
             let entry = entry?;
-            let definition = entry.value();
+            let definition = InternalTableDefinition::try_from_bytes(entry.value_bytes())?;
             match definition {
                 InternalTableDefinition::Normal {
                     table_root,
@@ -172,7 +177,7 @@ impl TableTree {
         table_type: TableType,
     ) -> Result<Option<InternalTableDefinition>, TableError> {
         if let Some(guard) = self.tree.get(&name)? {
-            let definition = guard.value();
+            let definition = InternalTableDefinition::try_from_bytes(guard.value_bytes())?;
             definition.check_match_untyped(table_type, name)?;
             Ok(Some(definition))
         } else {
@@ -356,7 +361,9 @@ impl TableTreeMut {
             core::mem::take(&mut self.pending_table_updates)
         {
             // Bypass .get_table() since the table types are dynamic
-            let mut definition = self.tree.get(&name.as_str())?.unwrap().value();
+            let guard = self.tree.get(&name.as_str())?.unwrap();
+            let mut definition = InternalTableDefinition::try_from_bytes(guard.value_bytes())?;
+            drop(guard);
             // No-op if the root has not changed and checksums are already finalized
             if !dirty {
                 match definition {
@@ -421,12 +428,15 @@ impl TableTreeMut {
         // Reserve space in the table tree, and make sure the path to the entry is
         // uncommitted, so that the final insert_inplace() below won't allocate or
         // free any pages.
+        if let Some(guard) = self.tree.get(&name)? {
+            InternalTableDefinition::try_from_bytes(guard.value_bytes())?;
+        }
         let bytes = self.tree.force_uncommitted(
             &name,
             &InternalTableDefinition::new::<K, V>(TableType::Normal, None, 0),
         )?;
 
-        let table_root = match InternalTableDefinition::from_bytes(&bytes) {
+        let table_root = match InternalTableDefinition::try_from_bytes(&bytes)? {
             InternalTableDefinition::Normal { table_root, .. } => table_root,
             InternalTableDefinition::Multimap { .. } => {
                 unreachable!()
@@ -565,7 +575,7 @@ impl TableTreeMut {
         // Move the definition as stored, not the pending update: staged roots must stay out
         // of the master tree, since reopening the table can free their pages (see stats())
         let stored_definition = if let Some(guard) = self.tree.get(&name)? {
-            let definition = guard.value();
+            let definition = InternalTableDefinition::try_from_bytes(guard.value_bytes())?;
             definition.check_match_untyped(table_type, name)?;
             Some(definition)
         } else {
@@ -672,7 +682,7 @@ impl TableTreeMut {
     ) -> Result {
         for entry in self.tree.range::<RangeFull, &str>(&(..))? {
             let entry = entry?;
-            let mut definition = entry.value();
+            let mut definition = InternalTableDefinition::try_from_bytes(entry.value_bytes())?;
             if let Some((updated_root, updated_length, _)) =
                 self.pending_table_updates.get(entry.key())
             {
@@ -705,7 +715,7 @@ impl TableTreeMut {
     ) -> Result {
         for entry in self.tree.range::<RangeFull, &str>(&(..))? {
             let entry = entry?;
-            let mut definition = entry.value();
+            let mut definition = InternalTableDefinition::try_from_bytes(entry.value_bytes())?;
             if let Some((updated_root, updated_length, _)) =
                 self.pending_table_updates.get(entry.key())
             {
@@ -745,7 +755,7 @@ impl TableTreeMut {
         let resolver = self.page_allocator.resolver();
         for entry in self.tree.range::<RangeFull, &str>(&(..))? {
             let entry = entry?;
-            let mut definition = entry.value();
+            let mut definition = InternalTableDefinition::try_from_bytes(entry.value_bytes())?;
             if let Some((updated_root, length, _)) = self.pending_table_updates.get(entry.key()) {
                 definition.set_header(*updated_root, *length);
             }
@@ -832,7 +842,9 @@ mod test {
             key_type: TypeName::new("test::Key"),
             value_type: TypeName::new("test::Value"),
         };
-        let y = InternalTableDefinition::from_bytes(InternalTableDefinition::as_bytes(&x).as_ref());
+        let y =
+            InternalTableDefinition::try_from_bytes(InternalTableDefinition::as_bytes(&x).as_ref())
+                .unwrap();
         assert_eq!(x, y);
     }
 }

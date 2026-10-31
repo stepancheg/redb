@@ -47,6 +47,10 @@ impl<K: Key, V: Value> EntryGuard<K, V> {
         V::from_bytes(&self.page.memory()[self.value_range.clone()])
     }
 
+    pub(crate) fn value_bytes(&self) -> &[u8] {
+        &self.page.memory()[self.value_range.clone()]
+    }
+
     pub(crate) fn into_raw(self) -> (PageImpl, Range<usize>, Range<usize>) {
         (self.page, self.key_range, self.value_range)
     }
