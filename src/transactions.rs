@@ -25,6 +25,7 @@ use crate::{
 };
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::sync::Arc;
@@ -222,14 +223,8 @@ impl Value for AllocatorStateKey {
     where
         Self: 'a,
     {
-        match data[0] {
-            // 0, 1, 2 were used in redb 2.x and have a different format
-            0..=2 => Self::Deprecated,
-            3 => Self::Region(u32::from_le_bytes(data[1..].try_into().unwrap())),
-            4 => Self::RegionTracker,
-            5 => Self::TransactionId,
-            _ => unreachable!(),
-        }
+        // Value::from_bytes cannot return Result. Tree walks use try_from_bytes.
+        Self::try_from_bytes(data).unwrap_or_else(|error| panic!("{error}"))
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
@@ -262,9 +257,43 @@ impl Value for AllocatorStateKey {
     }
 }
 
+impl AllocatorStateKey {
+    pub(crate) fn try_from_bytes(data: &[u8]) -> Result<Self> {
+        match data.first().copied() {
+            // 0, 1, 2 were used in redb 2.x and have a different format
+            Some(0..=2) => Ok(Self::Deprecated),
+            Some(3) => Ok(Self::Region(u32::from_le_bytes(
+                data[1..].try_into().unwrap(),
+            ))),
+            Some(4) => Ok(Self::RegionTracker),
+            Some(5) => Ok(Self::TransactionId),
+            Some(tag) => Err(StorageError::Corrupted(format!(
+                "Invalid allocator state key tag {tag}"
+            ))),
+            None => Err(StorageError::Corrupted(
+                "Allocator state key is missing its tag byte".to_string(),
+            )),
+        }
+    }
+
+    // Key::compare cannot return Result, so a bad tag is ordered after every valid key and
+    // reported here, before a reader trusts the tree.
+    pub(crate) fn check_tree(tree: &AllocatorStateTree) -> Result {
+        for entry in tree.range::<RangeFull, Self>(&(..))? {
+            Self::try_from_bytes(&entry?.key_data())?;
+        }
+        Ok(())
+    }
+}
+
 impl Key for AllocatorStateKey {
     fn compare(data1: &[u8], data2: &[u8]) -> core::cmp::Ordering {
-        Self::from_bytes(data1).cmp(&Self::from_bytes(data2))
+        match (Self::try_from_bytes(data1), Self::try_from_bytes(data2)) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            (Ok(_), Err(_)) => core::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => core::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => data1.cmp(data2),
+        }
     }
 }
 
@@ -2916,6 +2945,20 @@ mod test {
     #[cfg(feature = "experimental-api-5")]
     use crate::ReadableTable;
     use crate::{Database, ReadableDatabase, StorageError, TableDefinition, TransactionError};
+
+    #[test]
+    fn invalid_allocator_state_key_tag_is_corrupted() {
+        use super::AllocatorStateKey;
+        use crate::types::Key;
+
+        let err = AllocatorStateKey::try_from_bytes(&[6, 0, 0, 0, 0]).unwrap_err();
+        let StorageError::Corrupted(message) = err else {
+            panic!("unexpected error");
+        };
+        assert!(message.contains('6'));
+        // compare must not panic: Key::compare cannot return the error.
+        let _ = AllocatorStateKey::compare(&[6, 0, 0, 0, 0], &[5, 0, 0, 0, 0]);
+    }
 
     const X: TableDefinition<&str, &str> = TableDefinition::new("x");
     const BIG_VALUE: TableDefinition<u64, &[u8]> = TableDefinition::new("big_value");

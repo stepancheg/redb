@@ -1731,6 +1731,8 @@ impl TransactionalMemory {
 
     // Returns true if the allocator state table is up to date, or false if it's stale
     pub(crate) fn is_valid_allocator_state(&self, tree: &AllocatorStateTree) -> Result<bool> {
+        AllocatorStateKey::check_tree(tree)?;
+
         // See if this is stale allocator state left over from a previous transaction. That won't
         // happen during normal operation, since WriteTransaction::commit() always updates the
         // allocator state table before calling TransactionalMemory::commit(), but there are also
